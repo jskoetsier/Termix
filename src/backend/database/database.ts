@@ -2,6 +2,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import multer from "multer";
 import cookieParser from "cookie-parser";
+import { WebSocketServer, WebSocket } from "ws";
 import userRoutes from "./routes/users.js";
 import hostRoutes from "./routes/host.js";
 import alertRoutes from "./routes/alerts.js";
@@ -1982,13 +1983,126 @@ app.get(
   },
 );
 
-app.listen(HTTP_PORT, async () => {
+const server = app.listen(HTTP_PORT, async () => {
   const uploadsDir = path.join(process.cwd(), "uploads");
   if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
 
   await initializeSecurity();
+});
+
+const wsProxyServer = new WebSocketServer({ noServer: true });
+const TERMINAL_WS_PORT = 30002;
+const TERMINAL_WS_HOST = "127.0.0.1";
+
+wsProxyServer.on("connection", (clientWs, request) => {
+  const targetUrl = `ws://${TERMINAL_WS_HOST}:${TERMINAL_WS_PORT}${request.url}`;
+  let targetWs: WebSocket | null = null;
+
+  try {
+    targetWs = new WebSocket(targetUrl, {
+      headers: {
+        ...request.headers,
+        host: `${TERMINAL_WS_HOST}:${TERMINAL_WS_PORT}`,
+      },
+    });
+  } catch (err) {
+    databaseLogger.error("Failed to create WebSocket proxy connection", err, {
+      operation: "ws_proxy_connect",
+    });
+    clientWs.close(1011, "Internal proxy error");
+    return;
+  }
+
+  targetWs.on("open", () => {
+    databaseLogger.info("WebSocket proxy connection established", {
+      operation: "ws_proxy_connected",
+      target: targetUrl,
+    });
+  });
+
+  targetWs.on("message", (data) => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      try {
+        clientWs.send(data);
+      } catch (err) {
+        databaseLogger.error("Error forwarding message to client", err, {
+          operation: "ws_proxy_forward_to_client",
+        });
+      }
+    }
+  });
+
+  clientWs.on("message", (data) => {
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+      try {
+        targetWs.send(data);
+      } catch (err) {
+        databaseLogger.error("Error forwarding message to target", err, {
+          operation: "ws_proxy_forward_to_target",
+        });
+      }
+    }
+  });
+
+  const cleanup = () => {
+    if (targetWs) {
+      if (targetWs.readyState === WebSocket.OPEN) {
+        targetWs.close();
+      }
+      targetWs = null;
+    }
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.close();
+    }
+  };
+
+  targetWs.on("close", () => {
+    databaseLogger.info("WebSocket proxy target closed connection", {
+      operation: "ws_proxy_target_closed",
+    });
+    cleanup();
+  });
+
+  targetWs.on("error", (err) => {
+    databaseLogger.error("WebSocket proxy target error", err, {
+      operation: "ws_proxy_target_error",
+    });
+    cleanup();
+  });
+
+  clientWs.on("close", () => {
+    databaseLogger.info("WebSocket proxy client closed connection", {
+      operation: "ws_proxy_client_closed",
+    });
+    cleanup();
+  });
+
+  clientWs.on("error", (err) => {
+    databaseLogger.error("WebSocket proxy client error", err, {
+      operation: "ws_proxy_client_error",
+    });
+    cleanup();
+  });
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const upgradePath = "/ssh/websocket";
+  if (
+    request.url &&
+    (request.url.startsWith(upgradePath) ||
+      request.url.startsWith("/ssh/websocket/"))
+  ) {
+    databaseLogger.info("WebSocket upgrade request for terminal", {
+      operation: "ws_upgrade",
+      url: request.url,
+    });
+
+    wsProxyServer.handleUpgrade(request, socket, head, (ws) => {
+      wsProxyServer.emit("connection", ws, request);
+    });
+  }
 });
 
 const sslConfig = AutoSSLSetup.getSSLConfig();
